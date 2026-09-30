@@ -120,7 +120,7 @@ local io        = require "io"
 local json      = require "json"
 local dicom     = require "dicom"
 
-portrule = shortport.port_or_service({104, 11112, 4242}, "dicom", "tcp",
+portrule = shortport.port_or_service({104, 2762, 11112, 4242}, "dicom", "tcp",
     "open")
 
 -- File I/O and DCM parsing now provided by dicom.lua library:

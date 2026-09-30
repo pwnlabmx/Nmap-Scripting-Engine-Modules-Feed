@@ -50,6 +50,9 @@ Requires the dicom.lua library (place in nselib/ or same directory).
 --                               "standard" (+ common SOP classes),
 --                               "full" (+ all storage + workflow SOP classes)
 --                               (default: "standard")
+-- @args dicom.tls             Force transport for the whole DICOM suite:
+--                             "true" (DICOM over TLS), "false" (plaintext), or
+--                             unset to auto-detect (dicom-info only)
 --
 -- @output
 -- PORT     STATE SERVICE
@@ -87,7 +90,7 @@ local string    = require "string"
 local math      = require "math"
 local dicom     = require "dicom"
 
-portrule = shortport.port_or_service({104, 11112, 4242}, "dicom", "tcp",
+portrule = shortport.port_or_service({104, 2762, 11112, 4242}, "dicom", "tcp",
     "open")
 
 -----------------------------------------------------------------------
@@ -333,7 +336,8 @@ end
 -- @return accepted (list of {uid, name, category, transfer_syntax}),
 -- rejected_count
 local function probe_sop_classes(host, port, called_ae, calling_ae,
-                                  sop_entries, max_pdu, timeout_s, ts_uids)
+                                  sop_entries, max_pdu, timeout_s, ts_uids,
+                                  tls)
   local accepted = {}
   local rejected = 0
 
@@ -352,7 +356,7 @@ local function probe_sop_classes(host, port, called_ae, calling_ae,
 
     local ok, sock, pctxs, _, _, ac_info = dicom.do_associate(
       host, port, called_ae, calling_ae, batch_uids, max_pdu, timeout_s,
-          ts_uids)
+          ts_uids, nil, tls)
 
     if ok then
       -- Map pctx_id back to SOP class (pctx_id = 2*index - 1)
@@ -392,7 +396,7 @@ end
 -- @param timeout_s       Timeout in seconds
 -- @return List of accepted {uid, name} transfer syntaxes
 local function probe_transfer_syntaxes(host, port, called_ae, calling_ae,
-                                        sop_uid, max_pdu, timeout_s)
+                                        sop_uid, max_pdu, timeout_s, tls)
   local accepted = {}
 
   -- Test each transfer syntax individually (some servers only accept one per
@@ -400,7 +404,7 @@ local function probe_transfer_syntaxes(host, port, called_ae, calling_ae,
   for _, ts in ipairs(TS_CATALOG) do
     local ok, sock, pctxs = dicom.do_associate(
       host, port, called_ae, calling_ae, {sop_uid}, max_pdu, timeout_s,
-          {ts[1]})
+          {ts[1]}, nil, tls)
 
     if ok then
       local pctx_id = dicom.pick_accepted_pctx(pctxs)
@@ -414,6 +418,79 @@ local function probe_transfer_syntaxes(host, port, called_ae, calling_ae,
   return accepted
 end
 
+--- Format a certificate date, which may be a string or a date table.
+local function fmt_date(d)
+  if type(d) == "table" then
+    if d.year then
+      return string.format("%04d-%02d-%02d %02d:%02d:%02d",
+        d.year or 0, d.month or 0, d.day or 0,
+        d.hour or 0, d.min or 0, d.sec or 0)
+    end
+    return "?"
+  end
+  return tostring(d)
+end
+
+--- Describe a TLS certificate as a list of output lines.
+local function cert_lines(cert)
+  local subj = cert.subject and cert.subject.commonName or "?"
+  local iss  = cert.issuer and cert.issuer.commonName or "?"
+  local exp  = "?"
+  if cert.validity and cert.validity.notAfter then
+    exp = fmt_date(cert.validity.notAfter)
+  end
+  local lines = {
+    "Subject CN: " .. subj,
+    "Issuer CN: " .. iss,
+    "Not after: " .. exp,
+  }
+  -- Certificate key and signature strength (from the presented cert).
+  if cert.pubkey then
+    local ktype = tostring(cert.pubkey.type or "?")
+    local kbits = cert.pubkey.bits
+    local kline = "Public key: " .. ktype
+    if kbits then kline = kline .. " " .. tostring(kbits) .. "-bit" end
+    if ktype == "rsa" and kbits and kbits < 2048 then
+      kline = kline .. " (WEAK: < 2048-bit)"
+    end
+    lines[#lines + 1] = kline
+  end
+  if cert.sig_algorithm then
+    local sig = tostring(cert.sig_algorithm)
+    local sline = "Signature: " .. sig
+    local low = sig:lower()
+    if low:find("sha1") or low:find("md5") then
+      sline = sline .. " (WEAK signature algorithm)"
+    end
+    lines[#lines + 1] = sline
+  end
+  if subj ~= "?" and subj == iss then
+    lines[#lines + 1] = "Self-signed certificate"
+  end
+  return lines
+end
+
+--- Return weak-crypto / cert warnings for the WARNINGS section.
+local function cert_warnings(cert)
+  local w = {}
+  if cert.pubkey and cert.pubkey.type == "rsa" and cert.pubkey.bits
+     and cert.pubkey.bits < 2048 then
+    w[#w + 1] = "TLS certificate uses a weak RSA key (< 2048-bit)"
+  end
+  if cert.sig_algorithm then
+    local low = tostring(cert.sig_algorithm):lower()
+    if low:find("sha1") or low:find("md5") then
+      w[#w + 1] = "TLS certificate uses a weak signature algorithm (SHA-1/MD5)"
+    end
+  end
+  local subj = cert.subject and cert.subject.commonName
+  local iss  = cert.issuer and cert.issuer.commonName
+  if subj and iss and subj == iss then
+    w[#w + 1] = "TLS certificate is self-signed (no CA trust chain)"
+  end
+  return w
+end
+
 -----------------------------------------------------------------------
 -- MAIN ACTION
 -----------------------------------------------------------------------
@@ -425,12 +502,32 @@ action = function(host, port)
   local max_pdu     = tonumber(get_arg("max_pdu", "16384"))
   local probe_depth = get_arg("probe", "standard"):lower()
 
+  -- Transport: tls=true forces DICOM-over-TLS, tls=false forces plaintext,
+  -- unset auto-detects (plaintext first, then TLS).
+  local tls_arg = stdnse.get_script_args("dicom.tls")
+  local attempts
+  if tls_arg == "true" then
+    attempts = { true }
+  elseif tls_arg == "false" then
+    attempts = { false }
+  else
+    attempts = { false, true }
+  end
+
   local out = stdnse.output_table()
 
   -- == Phase 1: Fingerprint via Verification SOP class ==
-  local ok, sock, pctxs, server_max_pdu, elapsed, ac_info = dicom.do_associate(
-    host, port, called_ae, calling_ae,
-    {dicom.SOP_CLASS.VERIFICATION}, max_pdu, timeout_s)
+  local ok, sock, pctxs, server_max_pdu, elapsed, ac_info
+  local tls = false
+  for _, t in ipairs(attempts) do
+    ok, sock, pctxs, server_max_pdu, elapsed, ac_info = dicom.do_associate(
+      host, port, called_ae, calling_ae,
+      {dicom.SOP_CLASS.VERIFICATION}, max_pdu, timeout_s, nil, nil, t)
+    if ok then
+      tls = t
+      break
+    end
+  end
 
   if not ok then
     out["Error"] = string.format("Association failed: %s", tostring(sock))
@@ -503,7 +600,7 @@ action = function(host, port)
 
   local accepted_sops, rejected_count = probe_sop_classes(
     host, port, called_ae, calling_ae, probe_list, max_pdu, timeout_s,
-        probe_ts)
+        probe_ts, tls)
 
   local total_probed = #probe_list
   out["Accepted SOP Classes"] = string.format("%d of %d probed",
@@ -549,7 +646,7 @@ action = function(host, port)
   end
 
   local accepted_ts = probe_transfer_syntaxes(
-    host, port, called_ae, calling_ae, ts_probe_sop, max_pdu, timeout_s)
+    host, port, called_ae, calling_ae, ts_probe_sop, max_pdu, timeout_s, tls)
 
   if #accepted_ts > 0 then
     local ts_lines = {}
@@ -561,10 +658,17 @@ action = function(host, port)
   end
 
   -- == Security assessment ==
-  -- Check if port is using TLS (nmap would have detected SSL)
-  local has_tls = (port.version and port.version.service_tunnel == "ssl")
-  if has_tls then
-    out["Security"] = "TLS encrypted"
+  -- Transport was determined by our own association attempt above.
+  if tls then
+    out["Security"] = "DICOM over TLS (encrypted)"
+    if ac_info and ac_info.cert then
+      out["  TLS certificate"] = cert_lines(ac_info.cert)
+    end
+    -- We completed the TLS association without presenting a client
+    -- certificate, so the server does not require mutual TLS (IHE ATNA node
+    -- authentication).
+    out["  Client certificate"] =
+      "not required (no mutual TLS / IHE ATNA node authentication)"
   else
     out["Security"] = "No TLS (plaintext DICOM association)"
   end
@@ -613,8 +717,16 @@ action = function(host, port)
       storage_count)
   end
 
-  if not has_tls then
+  if not tls then
     warnings[#warnings + 1] = "No TLS - PHI transmitted in plaintext"
+  else
+    warnings[#warnings + 1] = "TLS server requires no client certificate"
+      .. " (no mutual TLS / IHE ATNA node authentication)"
+    if ac_info and ac_info.cert then
+      for _, w in ipairs(cert_warnings(ac_info.cert)) do
+        warnings[#warnings + 1] = w
+      end
+    end
   end
 
   if #warnings > 0 then

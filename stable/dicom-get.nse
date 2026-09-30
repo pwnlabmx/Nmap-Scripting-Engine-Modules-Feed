@@ -98,7 +98,7 @@ local string    = require "string"
 local math      = require "math"
 local dicom     = require "dicom"
 
-portrule = shortport.port_or_service({104, 11112, 4242}, "dicom", "tcp",
+portrule = shortport.port_or_service({104, 2762, 11112, 4242}, "dicom", "tcp",
     "open")
 
 -----------------------------------------------------------------------

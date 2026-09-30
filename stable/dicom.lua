@@ -1040,9 +1040,29 @@ function new_sock(timeout_s)
   return s
 end
 
---- Connect a TCP socket.  Returns ok, err.
-function tcp_connect(sock, host, port)
-  return sock:connect(host, port, "tcp")
+--- Whether DICOM-over-TLS is requested via the global "dicom.tls" script-arg.
+-- @return true if dicom.tls=true was supplied on the command line
+function tls_enabled()
+  return stdnse.get_script_args("dicom.tls") == "true"
+end
+
+--- Connect a socket.  Returns ok, err.
+-- @param sock Nmap socket
+-- @param host Host object
+-- @param port Port object (or number)
+-- @param tls  true = TLS, false = plain TCP, nil = honor the dicom.tls arg
+function tcp_connect(sock, host, port, tls)
+  if tls == nil then tls = tls_enabled() end
+  return sock:connect(host, port, tls and "ssl" or "tcp")
+end
+
+--- Fetch the peer's TLS certificate from a connected TLS socket, if any.
+-- @param sock Connected Nmap socket (TLS)
+-- @return certificate table (see nmap sslcert), or nil
+function get_cert(sock)
+  local ok, cert = pcall(function() return sock:get_ssl_certificate() end)
+  if ok then return cert end
+  return nil
 end
 
 --- Send all bytes on a socket.  Returns ok, err.
@@ -1252,7 +1272,8 @@ function start_connection(host, port)
   local dcm = {}
   local status, err
   dcm['socket'] = nmap.new_socket()
-  status, err = dcm['socket']:connect(host, port, "tcp")
+  local proto = tls_enabled() and "ssl" or "tcp"
+  status, err = dcm['socket']:connect(host, port, proto)
   if status == false then
     return false, "DICOM: Failed to connect to host: " .. err
   end
@@ -1383,12 +1404,15 @@ end
 --                       selection requests (request scp=true on storage SOP
 --                       classes for C-GET). Accepted roles are returned in
 --                       the ac_info table (6th return value) as .roles.
+-- @param tls            If true, wrap the association in TLS (DICOM-over-TLS);
+--                       the peer certificate is returned in ac_info.cert.
 -- @return ok, sock_or_err, pctx_map, server_max_pdu, elapsed_ms, ac_info
 function do_associate(host, port, called_ae, calling_ae, sop_classes, max_pdu,
-    timeout_s, transfer_uids, roles)
+    timeout_s, transfer_uids, roles, tls)
+  if tls == nil then tls = tls_enabled() end
   local sock = new_sock(timeout_s)
   local t0 = nmap.clock_ms()
-  local ok, err = tcp_connect(sock, host, port)
+  local ok, err = tcp_connect(sock, host, port, tls)
   if not ok then
     sock:close()
     return false, "CONN_REFUSED", nil, nil, nmap.clock_ms() - t0
@@ -1413,6 +1437,7 @@ function do_associate(host, port, called_ae, calling_ae, sop_classes, max_pdu,
   local pdu_type = string.byte(resp, 1)
   if pdu_type == PDU_CODES.ASSOCIATE_ACCEPT then
     local ac_info = parse_assoc_ac(resp)
+    if tls then ac_info.cert = get_cert(sock) end
     return true, sock, ac_info.pctxs, ac_info.max_pdu, elapsed, ac_info
   elseif pdu_type == PDU_CODES.ASSOCIATE_REJECT then
     sock:close()
